@@ -144,6 +144,43 @@ def test_import_csv_directory_rolls_back_invalid_import(
     }
 
 
+def test_import_csv_directory_rejects_duplicate_primary_key(
+    connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    write_fixture_csvs(
+        source_dir,
+        overrides={
+            # category_id 1 appears twice.
+            "categories.csv": (
+                "category_id,name,description\n"
+                "1,Guitars,Electric and acoustic guitars\n"
+                "2,Basses,Electric and acoustic basses\n"
+                "1,Guitars Duplicate,Should not import\n"
+            )
+        },
+    )
+
+    with pytest.raises(CsvImportError) as excinfo:
+        import_csv_directory(connection, source_dir)
+
+    # A clean CsvImportError naming the table/row, not a raw sqlite3
+    # IntegrityError leaking out of the importer.
+    assert any(
+        "categories" in error and "duplicate" in error and "1" in error
+        for error in excinfo.value.errors
+    )
+    assert _all_table_row_counts(connection) == {
+        "categories": 0,
+        "customers": 0,
+        "products": 0,
+        "orders": 0,
+        "order_items": 0,
+        "promotions": 0,
+    }
+
+
 def test_import_csv_directory_is_idempotent(
     connection: sqlite3.Connection, fixture_source_dir: Path
 ) -> None:

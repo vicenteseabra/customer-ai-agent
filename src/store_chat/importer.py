@@ -201,9 +201,14 @@ def import_csv_directory(connection: sqlite3.Connection, source_dir: Path) -> Im
     if errors:
         raise CsvImportError(errors)
 
-    connection.execute("BEGIN")
+    # `executescript()` issues its own implicit COMMIT before running, so it
+    # cannot be wrapped by a preceding BEGIN. The real transaction that makes
+    # this import atomic starts here, immediately after the schema is in
+    # place and before any data is cleared or inserted, and is rolled back as
+    # a whole in the `except` block below on any problem.
     try:
         connection.executescript(_SCHEMA)
+        connection.execute("BEGIN IMMEDIATE")
         for table in _CLEAR_ORDER:
             connection.execute(f"DELETE FROM {table}")
 
@@ -215,6 +220,9 @@ def import_csv_directory(connection: sqlite3.Connection, source_dir: Path) -> Im
         for i, row in enumerate(rows_by_table["categories"], start=1):
             category_id = _parse_int(row["category_id"], "categories", i, "category_id", errors)
             if category_id is None:
+                continue
+            if category_id in category_ids:
+                errors.append(f"categories row {i}: duplicate category_id {category_id}")
                 continue
             category_ids.add(category_id)
             connection.execute(
@@ -229,6 +237,9 @@ def import_csv_directory(connection: sqlite3.Connection, source_dir: Path) -> Im
         for i, row in enumerate(rows_by_table["customers"], start=1):
             customer_id = _parse_int(row["customer_id"], "customers", i, "customer_id", errors)
             if customer_id is None:
+                continue
+            if customer_id in customer_ids:
+                errors.append(f"customers row {i}: duplicate customer_id {customer_id}")
                 continue
             customer_ids.add(customer_id)
             connection.execute(
@@ -254,6 +265,9 @@ def import_csv_directory(connection: sqlite3.Connection, source_dir: Path) -> Im
                 errors.append(
                     f"products row {i}: category_id {category_id} does not exist in categories"
                 )
+                continue
+            if product_id in product_ids:
+                errors.append(f"products row {i}: duplicate product_id {product_id}")
                 continue
             product_ids.add(product_id)
             connection.execute(
@@ -288,6 +302,9 @@ def import_csv_directory(connection: sqlite3.Connection, source_dir: Path) -> Im
                 errors.append(
                     f"orders row {i}: customer_id {customer_id} does not exist in customers"
                 )
+                continue
+            if order_id in order_ids:
+                errors.append(f"orders row {i}: duplicate order_id {order_id}")
                 continue
             order_ids.add(order_id)
             connection.execute(
@@ -332,6 +349,7 @@ def import_csv_directory(connection: sqlite3.Connection, source_dir: Path) -> Im
         imported_rows["order_items"] = len(rows_by_table["order_items"])
 
         # promotions (reference products)
+        promotion_ids: set[int] = set()
         for i, row in enumerate(rows_by_table["promotions"], start=1):
             promotion_id = _parse_int(row["promotion_id"], "promotions", i, "promotion_id", errors)
             product_id = _parse_int(row["product_id"], "promotions", i, "product_id", errors)
@@ -346,6 +364,10 @@ def import_csv_directory(connection: sqlite3.Connection, source_dir: Path) -> Im
                     f"promotions row {i}: product_id {product_id} does not exist in products"
                 )
                 continue
+            if promotion_id in promotion_ids:
+                errors.append(f"promotions row {i}: duplicate promotion_id {promotion_id}")
+                continue
+            promotion_ids.add(promotion_id)
             connection.execute(
                 "INSERT INTO promotions "
                 "(promotion_id, product_id, discount_percent, description, is_active) "
@@ -359,8 +381,17 @@ def import_csv_directory(connection: sqlite3.Connection, source_dir: Path) -> Im
 
         connection.commit()
         return ImportReport(imported_rows=imported_rows)
-    except Exception:
+    except CsvImportError:
+        connection.rollback()
+        raise
+    except Exception as exc:
         connection.rollback()
         if errors:
             raise CsvImportError(errors) from None
+        if isinstance(exc, sqlite3.IntegrityError):
+            # Defense in depth: the per-table duplicate-id and foreign-key
+            # checks above should catch these before we ever reach SQLite,
+            # but translate any that slip through into the same error
+            # contract instead of leaking a raw sqlite3 exception.
+            raise CsvImportError([f"database integrity error during import: {exc}"]) from None
         raise
