@@ -34,9 +34,17 @@ def get_connection(database_path: Path) -> sqlite3.Connection:
 
     Creates the parent directory if it does not exist yet. Rows are returned
     as `sqlite3.Row` objects so callers can access columns by name.
+
+    `check_same_thread=False`: this connection is shared by the FastAPI app
+    (`store_chat.api`) across requests, and ASGI servers/test clients run
+    request handlers on a different thread than the one that constructed the
+    app's dependencies. Store Chat is a local, single-user tool with no
+    concurrent writers, so sharing one connection across threads here is
+    safe; this module still never mutates the schema or performs unguarded
+    concurrent writes.
     """
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(database_path))
+    connection = sqlite3.connect(str(database_path), check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
