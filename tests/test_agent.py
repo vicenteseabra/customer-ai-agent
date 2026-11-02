@@ -136,6 +136,83 @@ def test_system_prompt_establishes_store_persona_and_tone(
     assert "does not sell accessories" in system_prompt
 
 
+def test_system_prompt_instructs_agent_to_decline_off_topic_questions(
+    imported_connection: sqlite3.Connection,
+) -> None:
+    policies = FakePolicyIndex(chunks=[])
+    model = ScriptedChatClient(
+        [
+            ModelResponse(
+                content="I can only help with questions about Empório da Música.",
+                tool_calls=[],
+            )
+        ]
+    )
+    agent, _store, conversations = _make_agent(model, policies, imported_connection)
+    conversation = conversations.create_conversation()
+
+    agent.respond(conversation.id, "What's the capital of France?")
+
+    system_prompt = _system_message(model.calls)
+    assert "Only discuss topics related to Empório da Música" in system_prompt
+    assert "politely decline" in system_prompt
+
+
+def test_off_topic_decline_reply_is_persisted_unmodified(
+    imported_connection: sqlite3.Connection,
+) -> None:
+    policies = FakePolicyIndex(chunks=[])
+    decline_text = (
+        "I can only help with questions about Empório da Música -- "
+        "our instruments, orders, and policies."
+    )
+    model = ScriptedChatClient(
+        [ModelResponse(content=decline_text, tool_calls=[])]
+    )
+    agent, _store, conversations = _make_agent(model, policies, imported_connection)
+    conversation = conversations.create_conversation()
+
+    reply = agent.respond(conversation.id, "What's the capital of France?")
+
+    assert reply == decline_text
+    history = conversations.get_history(conversation.id)
+    assert history[-1].role == "assistant"
+    assert history[-1].content == decline_text
+
+
+def test_indirectly_phrased_in_scope_question_still_reaches_product_tool(
+    imported_connection: sqlite3.Connection,
+) -> None:
+    policies = FakePolicyIndex(chunks=[])
+    model = ScriptedChatClient(
+        [
+            ModelResponse(
+                content=None,
+                tool_calls=[
+                    ToolCall(
+                        name="search_products",
+                        arguments={"query": ""},
+                        call_id="call-1",
+                    )
+                ],
+            ),
+            ModelResponse(
+                content="Here are a few options under R$1000.",
+                tool_calls=[],
+            ),
+        ]
+    )
+    agent, _store, conversations = _make_agent(model, policies, imported_connection)
+    conversation = conversations.create_conversation()
+
+    reply = agent.respond(conversation.id, "What do you have under $1000?")
+
+    assert reply == "Here are a few options under R$1000."
+    first_call_messages, first_call_tools = model.calls[0]
+    assert any(tool.name == "search_products" for tool in first_call_tools)
+    assert len(model.calls) == 2
+
+
 def test_missing_policy_context_does_not_claim_a_store_policy(
     imported_connection: sqlite3.Connection,
 ) -> None:
