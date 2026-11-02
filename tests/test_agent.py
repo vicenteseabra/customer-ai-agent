@@ -112,6 +112,30 @@ def test_policy_question_uses_retrieved_chunks_and_answers_in_english(
     assert history[-1].content == reply
 
 
+def test_system_prompt_establishes_store_persona_and_tone(
+    imported_connection: sqlite3.Connection,
+) -> None:
+    policies = FakePolicyIndex(chunks=[])
+    model = ScriptedChatClient(
+        [
+            ModelResponse(
+                content="We're open Monday to Saturday -- happy to help!",
+                tool_calls=[],
+            )
+        ]
+    )
+    agent, _store, conversations = _make_agent(model, policies, imported_connection)
+    conversation = conversations.create_conversation()
+
+    agent.respond(conversation.id, "What are your store hours?")
+
+    system_prompt = _system_message(model.calls)
+    assert "Empório da Música" in system_prompt
+    assert "Campo Grande" in system_prompt
+    assert "founded in 2008" in system_prompt
+    assert "does not sell accessories" in system_prompt
+
+
 def test_missing_policy_context_does_not_claim_a_store_policy(
     imported_connection: sqlite3.Connection,
 ) -> None:
