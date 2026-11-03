@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import find_dotenv, load_dotenv
+
 DEFAULT_DATABASE_PATH = Path("data/store_chat.sqlite3")
 DEFAULT_SOURCE_DATA_DIR = Path("data/source")
 DEFAULT_VECTOR_STORE_PATH = Path("data/vector_store")
@@ -48,7 +50,12 @@ def load_settings() -> Settings:
     OLLAMA_BASE_URL, OLLAMA_CHAT_MODEL, OLLAMA_EMBEDDING_MODEL,
     STORE_CHAT_POLICY_CHUNK_SIZE, STORE_CHAT_POLICY_CHUNK_OVERLAP, and
     STORE_CHAT_POLICY_RELEVANCE_DISTANCE_THRESHOLD.
+
+    Loads a `.env` file from the current working directory (or a parent of
+    it) first, if one exists, without overriding variables already set in
+    the real environment.
     """
+    load_dotenv(find_dotenv(usecwd=True))
     return Settings(
         database_path=Path(
             os.environ.get("STORE_CHAT_DB_PATH", str(DEFAULT_DATABASE_PATH))

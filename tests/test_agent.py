@@ -12,11 +12,12 @@ from store_chat.agent import (
     AgentTool,
     ChatAgent,
     ChatMessage,
+    GeminiChatClient,
     InvalidToolCallError,
     ModelResponse,
     ModelUnavailableError,
     ToolCall,
-    _to_ollama_message,
+    _to_gemini_contents,
 )
 from store_chat.conversations import ConversationService
 from store_chat.policy_rag import PolicyChunk
@@ -518,8 +519,8 @@ def test_respond_persists_user_message_before_dispatch(
     assert [m.content for m in history] == ["Hello", "Hi there!"]
 
 
-def test_ollama_message_conversion_uses_tool_name_not_call_id() -> None:
-    """A role='tool' message's wire-format 'tool_name' must be the real tool
+def test_gemini_message_conversion_uses_tool_name_not_call_id() -> None:
+    """A role='tool' message's function-response part must use the real tool
     name (ChatMessage.name), never the call id (ChatMessage.tool_call_id) --
     the two are different pieces of information and must never be conflated.
     """
@@ -530,17 +531,20 @@ def test_ollama_message_conversion_uses_tool_name_not_call_id() -> None:
         name="verify_customer",
     )
 
-    payload = _to_ollama_message(message)
+    _system_instruction, contents = _to_gemini_contents([message])
 
-    assert payload["tool_name"] == "verify_customer"
-    assert payload["tool_name"] != "call-1"
+    assert len(contents) == 1
+    part = contents[0].parts[0]
+    assert part.function_response.name == "verify_customer"
+    assert part.function_response.name != "call-1"
 
 
-def test_ollama_message_conversion_carries_assistant_tool_calls() -> None:
+def test_gemini_message_conversion_carries_assistant_tool_calls() -> None:
     """An assistant turn that requested tool calls must round-trip those
-    calls into Ollama's own tool_calls wire shape, so a resumed conversation
-    sent to a real Ollama server shows the standard assistant-requested-
-    tool-calls transcript rather than silently dropping the request.
+    calls into Gemini's own function-call wire shape, so a resumed
+    conversation sent to a real Gemini model shows the standard
+    assistant-requested-tool-calls transcript rather than silently dropping
+    the request.
     """
     message = ChatMessage(
         role="assistant",
@@ -550,18 +554,49 @@ def test_ollama_message_conversion_carries_assistant_tool_calls() -> None:
         ],
     )
 
-    payload = _to_ollama_message(message)
+    _system_instruction, contents = _to_gemini_contents([message])
 
-    assert payload["tool_calls"] == [
-        {"function": {"name": "search_products", "arguments": {"query": "bass"}}}
-    ]
+    assert len(contents) == 1
+    assert contents[0].role == "model"
+    part = contents[0].parts[0]
+    assert part.function_call.name == "search_products"
+    assert part.function_call.args == {"query": "bass"}
 
 
-def test_ollama_message_conversion_plain_assistant_message_has_no_tool_calls_key() -> None:
-    """A plain final-answer assistant message (no tool calls) must not carry
-    a spurious empty tool_calls key in the wire format."""
-    message = ChatMessage(role="assistant", content="Hello there.")
+def test_gemini_message_conversion_handles_list_shaped_function_result() -> None:
+    """A tool result that decodes to a JSON list (e.g. search_products) must
+    still produce a valid function-response part: Gemini's function-response
+    `response` field must be a JSON object, never a bare array, so the list
+    is wrapped rather than passed through directly."""
+    message = ChatMessage(
+        role="tool",
+        content=json.dumps([{"name": "Stratocaster"}]),
+        tool_call_id="call-1",
+        name="search_products",
+    )
 
-    payload = _to_ollama_message(message)
+    _system_instruction, contents = _to_gemini_contents([message])
 
-    assert "tool_calls" not in payload
+    part = contents[0].parts[0]
+    assert part.function_response.response == {"result": [{"name": "Stratocaster"}]}
+
+
+def test_gemini_chat_client_wraps_client_errors_as_model_unavailable() -> None:
+    """Any failure from the underlying google-genai client must surface as
+    ModelUnavailableError, never a guessed/success-shaped response."""
+
+    class _FailingModels:
+        def generate_content(self, **_kwargs: object) -> None:
+            raise RuntimeError("rate limit exceeded")
+
+    class _FailingClient:
+        models = _FailingModels()
+
+    client = GeminiChatClient(model="gemini-2.5-flash", api_key="unused")
+    client._client = _FailingClient()
+
+    with pytest.raises(ModelUnavailableError):
+        client.chat(
+            messages=[ChatMessage(role="system", content="You are helpful.")],
+            tools=[],
+        )

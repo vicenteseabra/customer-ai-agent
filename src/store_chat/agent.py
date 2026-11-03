@@ -1,6 +1,6 @@
-"""Local chat agent orchestration: prompt building and typed tool dispatch.
+"""Chat agent orchestration: prompt building and typed tool dispatch.
 
-`ChatAgent` is the only piece of this system that talks to a local chat
+`ChatAgent` is the only piece of this system that talks to the chat
 model. It builds an English system prompt from retrieved policy chunks and
 conversation history, asks the model what to do, and dispatches any tool
 calls the model makes to the real repository/service methods -- but only
@@ -29,7 +29,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from store_chat.config import DEFAULT_CHAT_MODEL, DEFAULT_OLLAMA_BASE_URL
+from store_chat.config import DEFAULT_CHAT_MODEL
 from store_chat.conversations import ConversationService
 from store_chat.policy_rag import PolicyChunk, PolicyIndex
 from store_chat.repositories import StoreRepository
@@ -39,7 +39,7 @@ MAX_TOOL_ITERATIONS = 6
 
 
 class ModelUnavailableError(Exception):
-    """Raised when the local chat model cannot be reached or fails to respond."""
+    """Raised when the chat model cannot be reached or fails to respond."""
 
 
 class InvalidToolCallError(Exception):
@@ -86,7 +86,7 @@ class ToolCall:
 
 @dataclass(frozen=True)
 class ModelResponse:
-    """What the local chat model returned for one `chat()` call."""
+    """What the chat model returned for one `chat()` call."""
 
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
@@ -106,96 +106,132 @@ class AgentTool:
     parameters: dict[str, object]
 
 
-class LocalChatClient(Protocol):
-    """A local chat model that can be given tool declarations and asked to respond."""
+class ChatClient(Protocol):
+    """A chat model that can be given tool declarations and asked to respond."""
 
     def chat(self, messages: list[ChatMessage], tools: list[AgentTool]) -> ModelResponse:
         """Return the model's next turn, given the conversation so far and the
         declared tools it may call.
 
         Implementations must raise `ModelUnavailableError` (not return a
-        guessed/success-shaped response) when the local model cannot be
-        reached or fails.
+        guessed/success-shaped response) when the model cannot be reached or
+        fails.
         """
         ...
 
 
-def _to_ollama_message(message: ChatMessage) -> dict[str, object]:
-    """Convert a `ChatMessage` to the plain dict shape the installed `ollama`
-    package's `Client.chat` expects.
+def _to_gemini_contents(messages: list[ChatMessage]) -> tuple[str, list[object]]:
+    """Split a `ChatMessage` history into Gemini's `(system_instruction, contents)`
+    shape.
 
-    A `role="tool"` message's `tool_name` field is the real tool name
+    Gemini keeps the system prompt out of the turn history entirely (it is a
+    separate `GenerateContentConfig` field), unlike Ollama's flat message
+    list with a `role="system"` entry -- so the one system message is pulled
+    out here rather than converted into a `Content`.
+
+    A `role="tool"` message's function-response part uses the real tool name
     (`message.name`), never `message.tool_call_id` -- the id has no place in
-    Ollama's wire format and is purely this module's own internal
-    correlation key (see `ChatMessage`'s docstring). A `role="assistant"`
-    message that recorded the model's own tool-call request carries those
-    calls back out as Ollama's `tool_calls` shape, so a resumed conversation
-    looks like a standard assistant-requests-tools -> tool-results transcript.
+    Gemini's wire format and is purely this module's own internal
+    correlation key (see `ChatMessage`'s docstring). Its JSON-decoded content
+    is wrapped as `{"result": ...}` because Gemini's function-response
+    `response` field must be a JSON object, and a tool's result may decode to
+    a bare list (e.g. `search_products`).
+
+    A `role="assistant"` message that recorded the model's own tool-call
+    request carries those calls back out as Gemini's function-call parts, so
+    a resumed conversation looks like a standard assistant-requests-tools ->
+    tool-results transcript.
     """
-    payload: dict[str, object] = {"role": message.role, "content": message.content}
-    if message.role == "tool":
-        if message.name is not None:
-            payload["tool_name"] = message.name
-    elif message.role == "assistant" and message.tool_calls:
-        payload["tool_calls"] = [
-            {"function": {"name": call.name, "arguments": call.arguments}}
-            for call in message.tool_calls
-        ]
-    return payload
+    from google.genai import types
+
+    system_instruction = ""
+    contents: list[types.Content] = []
+    for message in messages:
+        if message.role == "system":
+            system_instruction = message.content
+        elif message.role == "user":
+            contents.append(
+                types.Content(role="user", parts=[types.Part.from_text(text=message.content)])
+            )
+        elif message.role == "assistant":
+            if message.tool_calls:
+                contents.append(
+                    types.Content(
+                        role="model",
+                        parts=[
+                            types.Part.from_function_call(name=call.name, args=call.arguments)
+                            for call in message.tool_calls
+                        ],
+                    )
+                )
+            else:
+                contents.append(
+                    types.Content(
+                        role="model", parts=[types.Part.from_text(text=message.content)]
+                    )
+                )
+        elif message.role == "tool":
+            contents.append(
+                types.Content(
+                    role="tool",
+                    parts=[
+                        types.Part.from_function_response(
+                            name=message.name,
+                            response={"result": json.loads(message.content)},
+                        )
+                    ],
+                )
+            )
+    return system_instruction, contents
 
 
-def _to_ollama_tool(tool: AgentTool) -> dict[str, object]:
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": tool.parameters,
-        },
-    }
+def _to_gemini_tool(tool: AgentTool) -> object:
+    from google.genai import types
+
+    return types.FunctionDeclaration(
+        name=tool.name, description=tool.description, parameters_json_schema=tool.parameters
+    )
 
 
-class OllamaChatClient:
-    """`LocalChatClient` backed by a local Ollama server.
+class GeminiChatClient:
+    """`ChatClient` backed by the Gemini API's free tier.
 
-    Never contacts a hosted model: `base_url` must point at a local Ollama
-    instance (default `http://localhost:11434`). Any failure to reach the
-    server or to get a usable response is raised as `ModelUnavailableError`.
+    `api_key` is a Gemini API key (see Google AI Studio). Any failure to
+    reach the API or to get a usable response is raised as
+    `ModelUnavailableError`.
     """
 
-    def __init__(
-        self,
-        model: str = DEFAULT_CHAT_MODEL,
-        base_url: str = DEFAULT_OLLAMA_BASE_URL,
-    ) -> None:
-        import ollama
+    def __init__(self, model: str = DEFAULT_CHAT_MODEL, api_key: str = "") -> None:
+        from google import genai
 
         self._model = model
-        self._client = ollama.Client(host=base_url)
+        self._client = genai.Client(api_key=api_key)
 
     def chat(self, messages: list[ChatMessage], tools: list[AgentTool]) -> ModelResponse:
+        from google.genai import types
+
+        system_instruction, contents = _to_gemini_contents(messages)
         try:
-            response = self._client.chat(
+            response = self._client.models.generate_content(
                 model=self._model,
-                messages=[_to_ollama_message(message) for message in messages],
-                tools=[_to_ollama_tool(tool) for tool in tools],
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    tools=[types.Tool(function_declarations=[_to_gemini_tool(t) for t in tools])],
+                ),
             )
-        except Exception as exc:  # the ollama client raises several distinct types
+        except Exception as exc:  # the genai client raises several distinct types
             raise ModelUnavailableError(
-                f"local chat model '{self._model}' is unavailable: {exc}"
+                f"chat model '{self._model}' is unavailable: {exc}"
             ) from exc
 
-        message = response.message
-        raw_tool_calls = message.tool_calls or []
+        raw_tool_calls = response.function_calls or []
         tool_calls = [
-            ToolCall(
-                name=raw_call.function.name,
-                arguments=dict(raw_call.function.arguments),
-                call_id=f"call-{index}",
-            )
-            for index, raw_call in enumerate(raw_tool_calls)
+            ToolCall(name=fc.name, arguments=dict(fc.args), call_id=f"call-{index}")
+            for index, fc in enumerate(raw_tool_calls)
         ]
-        return ModelResponse(content=message.content, tool_calls=tool_calls)
+        content = None if raw_tool_calls else response.text
+        return ModelResponse(content=content, tool_calls=tool_calls)
 
 
 # --- Typed tool input schemas -----------------------------------------------
@@ -360,7 +396,7 @@ class ChatAgent:
 
     def __init__(
         self,
-        model_client: LocalChatClient,
+        model_client: ChatClient,
         policies: PolicyIndex,
         store: StoreRepository,
         conversations: ConversationService,
@@ -506,6 +542,6 @@ class ChatAgent:
                 )
 
         raise ModelUnavailableError(
-            "local chat model did not produce a final answer after "
+            "chat model did not produce a final answer after "
             f"{MAX_TOOL_ITERATIONS} tool-call rounds"
         )
