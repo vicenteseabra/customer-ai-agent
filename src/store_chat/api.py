@@ -2,22 +2,22 @@
 
 `create_app` is the dependency-injection seam: it takes an already-built
 `ChatAgent` and `ConversationService`, so tests can supply test doubles
-(scripted/failing `LocalChatClient`, a temporary SQLite file) without ever
-touching a real Ollama server or a shared database. `build_app` is the
-runtime wiring that constructs the real local-only implementations
-(`OllamaChatClient`, `OllamaEmbeddingClient`, `ChromaVectorStore`) from
-`Settings`.
+(scripted/failing `ChatClient`, a temporary SQLite file) without ever
+touching a real Gemini API or a shared database. `build_app` is the runtime
+wiring that constructs the real implementations from `Settings`: local
+embeddings/RAG (`OllamaEmbeddingClient`, `ChromaVectorStore`) and a Gemini
+chat client (`GeminiChatClient`).
 
 Exception-to-status-code mapping:
-- `ModelUnavailableError` (the local chat model could not be reached, or
-  never produced a final answer) -> 503 Service Unavailable. This is a
+- `ModelUnavailableError` (the chat model could not be reached, or never
+  produced a final answer) -> 503 Service Unavailable. This is a
   "try again later" condition, not a client input problem.
 - `InvalidToolCallError` (the model itself called an undeclared tool, or
   called a declared tool with invalid arguments) -> 502 Bad Gateway. This is
   server-side/model misbehavior -- the user's request was well-formed, but
-  the upstream local model did not honor the tool contract this server
-  enforces. It is deliberately not a 503 (the model process answered; it
-  just misbehaved) and never a 500 (the handler is expected and provides a
+  the upstream model did not honor the tool contract this server enforces.
+  It is deliberately not a 503 (the model process answered; it just
+  misbehaved) and never a 500 (the handler is expected and provides a
   clean, generic message rather than an unhandled-exception traceback).
 
 In both cases the route lets the exception propagate as an `HTTPException`
@@ -37,9 +37,9 @@ from uuid import UUID
 
 from store_chat.agent import (
     ChatAgent,
+    GeminiChatClient,
     InvalidToolCallError,
     ModelUnavailableError,
-    OllamaChatClient,
 )
 from store_chat.config import Settings, load_settings
 from store_chat.conversations import ConversationService
@@ -110,7 +110,7 @@ def create_app(
         except ModelUnavailableError:
             raise HTTPException(
                 status_code=503,
-                detail="The local chat model is unavailable right now. Please try again shortly.",
+                detail="The chat model is unavailable right now. Please try again shortly.",
             )
         except InvalidToolCallError:
             raise HTTPException(
@@ -130,12 +130,12 @@ def create_app(
 
 
 def build_app(settings: Settings | None = None) -> FastAPI:
-    """Build the FastAPI app with real, local-only runtime dependencies.
+    """Build the FastAPI app with real runtime dependencies.
 
     Constructs a SQLite connection, the store repository, the conversation
-    service, a local-PDF-backed policy index (Ollama embeddings + a
-    persistent on-disk ChromaDB collection), and a local Ollama chat model
-    client -- all driven by `settings` (loaded from the environment when not
+    service, a local-PDF-backed policy index (local Ollama embeddings + a
+    persistent on-disk ChromaDB collection), and a Gemini chat client --
+    all driven by `settings` (loaded from the environment when not
     supplied).
     """
     if settings is None:
@@ -159,7 +159,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
         relevance_distance_threshold=settings.policy_relevance_distance_threshold,
     )
 
-    model_client = OllamaChatClient(model=settings.chat_model, base_url=settings.ollama_base_url)
+    model_client = GeminiChatClient(model=settings.chat_model, api_key=settings.gemini_api_key)
     agent = ChatAgent(model_client, policies, store, conversations)
 
     return create_app(settings, agent, conversations)

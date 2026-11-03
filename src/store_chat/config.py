@@ -12,7 +12,7 @@ DEFAULT_DATABASE_PATH = Path("data/store_chat.sqlite3")
 DEFAULT_SOURCE_DATA_DIR = Path("data/source")
 DEFAULT_VECTOR_STORE_PATH = Path("data/vector_store")
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_CHAT_MODEL = "llama3.1"
+DEFAULT_CHAT_MODEL = "gemini-2.5-flash"
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 
 # Policy PDF chunking: fixed-size character windows with overlap, so no
@@ -37,6 +37,7 @@ class Settings:
     vector_store_path: Path
     ollama_base_url: str
     chat_model: str
+    gemini_api_key: str
     embedding_model: str
     policy_chunk_size: int
     policy_chunk_overlap: int
@@ -68,6 +69,7 @@ def load_settings() -> Settings:
         ),
         ollama_base_url=os.environ.get("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL),
         chat_model=os.environ.get("OLLAMA_CHAT_MODEL", DEFAULT_CHAT_MODEL),
+        gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
         embedding_model=os.environ.get(
             "OLLAMA_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL
         ),

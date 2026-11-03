@@ -2,8 +2,8 @@
 
 These tests build the app through `create_app`'s dependency-injection seam
 (real `ConversationService`/`StoreRepository` backed by a temporary SQLite
-file, plus scripted/failing `LocalChatClient` test doubles) so no test ever
-talks to a real Ollama server.
+file, plus scripted/failing `ChatClient` test doubles) so no test ever
+talks to a real Gemini API or Ollama server.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ class FakePolicyIndex:
 
 
 class ScriptedChatClient:
-    """Test double for LocalChatClient: replays a scripted sequence of responses."""
+    """Test double for ChatClient: replays a scripted sequence of responses."""
 
     def __init__(self, responses: list[ModelResponse]) -> None:
         self._responses = list(responses)
@@ -53,7 +53,7 @@ class ScriptedChatClient:
 
 
 class FailingChatClient:
-    """Test double for LocalChatClient: always raises, simulating an unreachable model."""
+    """Test double for ChatClient: always raises, simulating an unreachable model."""
 
     def __init__(self, error: Exception) -> None:
         self._error = error
@@ -69,6 +69,7 @@ def _test_settings(database_path: Path) -> Settings:
         vector_store_path=Path("unused"),
         ollama_base_url="http://localhost:11434",
         chat_model="unused",
+        gemini_api_key="unused",
         embedding_model="unused",
         policy_chunk_size=500,
         policy_chunk_overlap=50,
